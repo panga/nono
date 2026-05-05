@@ -6,8 +6,12 @@
 
 pub(crate) mod builtin;
 
+use crate::command_policy::{
+    validate_command_policies, validate_legacy_blocked_command_interactions, CommandPoliciesConfig,
+    CommandPolicyValidationScope,
+};
 use nono::{NonoError, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1198,6 +1202,24 @@ where
     })
 }
 
+fn deserialize_command_policies<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<CommandPoliciesConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Err(D::Error::custom(
+            "command_policies cannot be null; omit the field or use an empty object",
+        ));
+    };
+
+    CommandPoliciesConfig::deserialize(value)
+        .map(Some)
+        .map_err(D::Error::custom)
+}
+
 /// A complete profile definition
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Profile {
@@ -1221,6 +1243,8 @@ pub struct Profile {
     pub env_credentials: SecretsConfig,
     #[serde(default)]
     pub environment: Option<EnvironmentConfig>,
+    #[serde(default)]
+    pub command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
@@ -1301,6 +1325,8 @@ struct ProfileDeserialize {
     env_credentials: SecretsConfig,
     #[serde(default)]
     environment: Option<EnvironmentConfig>,
+    #[serde(default, deserialize_with = "deserialize_command_policies")]
+    command_policies: Option<CommandPoliciesConfig>,
     #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
@@ -1338,6 +1364,7 @@ impl From<ProfileDeserialize> for Profile {
             network: raw.network,
             env_credentials: raw.env_credentials,
             environment: raw.environment,
+            command_policies: raw.command_policies,
             workdir: raw.workdir,
             hooks: raw.hooks,
             rollback: raw.rollback,
@@ -1779,6 +1806,17 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     merge_implicit_default_groups(&mut profile)?;
+    validate_command_policies(
+        profile.command_policies.as_ref(),
+        CommandPolicyValidationScope::Resolved,
+    )
+    .into_result()?;
+    validate_legacy_blocked_command_interactions(
+        profile.command_policies.as_ref(),
+        &profile.policy.add_deny_commands,
+        &profile.security.allowed_commands,
+    )
+    .into_result()?;
     Ok(profile)
 }
 
@@ -1851,6 +1889,18 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
 
     // Validate env_credentials keys (URI entries need structural validation)
     validate_env_credential_keys(&profile)?;
+
+    validate_command_policies(
+        profile.command_policies.as_ref(),
+        CommandPolicyValidationScope::Syntax,
+    )
+    .into_result()?;
+    validate_legacy_blocked_command_interactions(
+        profile.command_policies.as_ref(),
+        &profile.policy.add_deny_commands,
+        &profile.security.allowed_commands,
+    )
+    .into_result()?;
 
     Ok(profile)
 }
@@ -2129,6 +2179,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 allow_vars: dedup_append(&base_env.allow_vars, &child_env.allow_vars),
             }),
         },
+        command_policies: merge_command_policies(&base.command_policies, &child.command_policies),
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
         // A child cannot override a base's workdir grant to None. This is a v1 limitation;
         // fixing it requires wrapping in Option<WorkdirAccess> and updating all consumers.
@@ -2171,6 +2222,18 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &base.unsafe_macos_seatbelt_rules,
             &child.unsafe_macos_seatbelt_rules,
         ),
+    }
+}
+
+fn merge_command_policies(
+    base: &Option<CommandPoliciesConfig>,
+    child: &Option<CommandPoliciesConfig>,
+) -> Option<CommandPoliciesConfig> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(child)) => Some(child.clone()),
+        (Some(base), Some(child)) => Some(base.merge_child(child)),
     }
 }
 
@@ -3826,6 +3889,7 @@ mod tests {
                 },
             },
             environment: None,
+            command_policies: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -3905,6 +3969,7 @@ mod tests {
                 },
             },
             environment: None,
+            command_policies: None,
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },
@@ -4968,6 +5033,23 @@ mod tests {
         .expect("top-level $schema must be accepted");
 
         assert_eq!(profile.meta.name, "schema-ok");
+    }
+
+    #[test]
+    fn test_command_policies_null_rejected() {
+        let result: std::result::Result<Profile, _> = serde_json::from_str(
+            r#"{
+                "meta": { "name": "null-command-policies" },
+                "command_policies": null
+            }"#,
+        );
+
+        assert!(result.is_err());
+        let err = result.expect_err("command_policies null should be rejected");
+        assert!(
+            err.to_string().contains("command_policies cannot be null"),
+            "error should describe null rejection: {err}"
+        );
     }
 
     #[test]

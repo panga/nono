@@ -417,6 +417,7 @@ struct PendingCwdAccessRequest {
 pub(crate) struct PreparedSandbox {
     pub(crate) caps: CapabilitySet,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
+    pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
     pub(crate) network_profile: Option<String>,
@@ -993,6 +994,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             PreparedSandbox {
                 caps,
                 secrets: Vec::new(),
+                command_policies: None,
                 rollback_exclude_patterns,
                 rollback_exclude_globs,
                 network_profile: None,
@@ -1020,6 +1022,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     let prepared_profile = prepare_profile(args, silent, &workdir)?;
     let crate::profile_runtime::PreparedProfile {
         loaded_profile,
+        command_policies,
         capability_elevation,
         #[cfg(target_os = "linux")]
         wsl2_proxy_policy,
@@ -1264,6 +1267,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         PreparedSandbox {
             caps,
             secrets: loaded_secrets,
+            command_policies,
             rollback_exclude_patterns: profile_rollback_patterns,
             rollback_exclude_globs: profile_rollback_globs,
             network_profile: profile_network_profile,

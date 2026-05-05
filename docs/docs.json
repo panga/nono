@@ -44,6 +44,8 @@
           "cli/features/session-lifecycle",
           "cli/features/profiles-groups",
           "cli/features/profile-authoring",
+          "cli/features/ephemeral-tool-isolation",
+          "cli/features/eti-composable-witness",
           "cli/features/atomic-rollbacks",
           "cli/features/audit",
           "cli/features/supervisor",

@@ -150,14 +150,22 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let trust = &flags.trust;
     let proxy = &flags.proxy;
     let session = &flags.session;
+    let eti_active = flags
+        .command_policies
+        .as_ref()
+        .is_some_and(crate::command_policy::CommandPoliciesConfig::is_active);
 
-    if let Some(blocked) =
-        config::check_blocked_command(&program, caps.allowed_commands(), caps.blocked_commands())?
-    {
-        return Err(NonoError::BlockedCommand {
-            command: blocked,
-            reason: command_blocking_deprecation::BLOCKED_COMMAND_REASON.to_string(),
-        });
+    if !eti_active {
+        if let Some(blocked) = config::check_blocked_command(
+            &program,
+            caps.allowed_commands(),
+            caps.blocked_commands(),
+        )? {
+            return Err(NonoError::BlockedCommand {
+                command: blocked,
+                reason: command_blocking_deprecation::BLOCKED_COMMAND_REASON.to_string(),
+            });
+        }
     }
 
     let command: Vec<String> = std::iter::once(program.to_string_lossy().into_owned())
@@ -200,6 +208,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     let strategy = flags.strategy;
+    if eti_active && !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
+        return Err(NonoError::ConfigParse(
+            "ETI command_policies require supervised execution".to_string(),
+        ));
+    }
 
     if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
         output::print_supervised_info(flags.silent, rollback.requested, proxy.active);
@@ -209,9 +222,59 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
 
-    let current_dir = execution_start_dir(&flags.workdir, &caps)?;
+    let requested_workdir =
+        flags
+            .workdir
+            .canonicalize()
+            .map_err(|e| NonoError::PathCanonicalization {
+                path: flags.workdir.to_path_buf(),
+                source: e,
+            })?;
+    let current_dir = if eti_active {
+        requested_workdir.clone()
+    } else {
+        execution_start_dir(&flags.workdir, &caps)?
+    };
+    #[cfg(target_os = "linux")]
+    let eti_runtime = if let Some(command_policies) = flags
+        .command_policies
+        .as_ref()
+        .filter(|config| config.is_active())
+    {
+        let runtime = crate::eti_runtime::PreparedEtiRuntime::prepare(
+            command_policies,
+            caps.allowed_commands(),
+            caps.blocked_commands(),
+            &resolved_program,
+            &caps,
+            &requested_workdir,
+        )?;
+        runtime.grant_outer_caps(&mut caps)?;
+        Some(runtime)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let eti_runtime: Option<crate::eti_runtime::PreparedEtiRuntime> = None;
+
+    #[cfg(target_os = "linux")]
+    let exec_resolved_program = eti_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.shim_for_initial_command(&command[0]))
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| resolved_program.clone());
+    #[cfg(not(target_os = "linux"))]
+    let exec_resolved_program = resolved_program.clone();
+
+    #[cfg(target_os = "linux")]
+    if let Some(runtime) = eti_runtime.as_ref() {
+        if let Some(err) = runtime.direct_initial_exec_denial(&command[0], &resolved_program)? {
+            return Err(err);
+        }
+    }
+
     let executable_identity = if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
-        Some(compute_executable_identity(&resolved_program)?)
+        Some(compute_executable_identity(&exec_resolved_program)?)
     } else {
         None
     };
@@ -228,6 +291,15 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .map(|secret| (secret.env_var.as_str(), secret.value.as_str()))
         .collect();
     for (key, value) in &proxy_env_vars {
+        env_vars.push((key.as_str(), value.as_str()));
+    }
+    #[cfg(target_os = "linux")]
+    let eti_env_vars = eti_runtime
+        .as_ref()
+        .map(crate::eti_runtime::PreparedEtiRuntime::env_overrides)
+        .unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    for (key, value) in &eti_env_vars {
         env_vars.push((key.as_str(), value.as_str()));
     }
 
@@ -286,12 +358,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 
     let config = exec_strategy::ExecConfig {
         command: &command,
-        resolved_program: &resolved_program,
+        resolved_program: &exec_resolved_program,
         caps: &caps,
         env_vars,
         cap_file: &cap_file_path,
         current_dir: &current_dir,
         no_diagnostics: flags.no_diagnostics || flags.silent,
+        diagnostic_verbosity: flags.diagnostic_verbosity,
         threading,
         protected_paths: &trust.protected_paths,
         profile_save_base: flags
@@ -312,6 +385,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
         allowed_env_vars: flags.allowed_env_vars,
+        eti_runtime: eti_runtime.as_ref(),
     };
 
     match strategy {

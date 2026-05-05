@@ -14,7 +14,7 @@ use crate::{
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 struct SessionRuntimeState {
     started: String,
@@ -179,10 +179,13 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     } else {
         None
     };
-    let audit_recorder = if audit_state.is_some() && !rollback.no_audit_integrity {
+    let audit_recorder = if audit_state.is_some() {
         audit_state
             .as_ref()
-            .map(|state| AuditRecorder::new(state.session_dir.clone()).map(Mutex::new))
+            .map(|state| {
+                AuditRecorder::new(state.session_dir.clone())
+                    .map(|recorder| Arc::new(Mutex::new(recorder)))
+            })
             .transpose()?
     } else {
         None
@@ -205,7 +208,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         detach_sequence: session.detach_sequence.as_deref(),
         open_url_origins: &proxy.open_url_origins,
         open_url_allow_localhost: proxy.open_url_allow_localhost,
-        audit_recorder: audit_recorder.as_ref(),
+        audit_recorder: audit_recorder.clone(),
         allow_launch_services_active: proxy.allow_launch_services_active,
         #[cfg(target_os = "linux")]
         proxy_port: match caps.network_mode() {
@@ -217,6 +220,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             nono::NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
+        #[cfg(target_os = "linux")]
+        eti_runtime: config.eti_runtime,
     };
 
     if !session.detached_start {
@@ -247,7 +252,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         rollback_state,
         audit_snapshot_state,
         audit_tracked_paths,
-        audit_recorder: audit_recorder.as_ref(),
+        audit_recorder: audit_recorder.as_deref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
         executable_identity,

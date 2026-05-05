@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) struct PreparedProfile {
     pub(crate) loaded_profile: Option<profile::Profile>,
+    pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: profile::Wsl2ProxyPolicy,
@@ -287,6 +288,7 @@ fn prepare_profile_with_options(
         // wrap, shell, profile show, why, learn) without duplication.
         let profile = profile::load_profile(profile_name)?;
         verify_profile_packs(&profile.packs)?;
+        validate_command_policy_runtime_support(&profile)?;
 
         if !profile.packs.is_empty() && !options.hook_output_silent {
             eprintln!("  Verified {} pack(s)", profile.packs.len());
@@ -387,7 +389,94 @@ fn prepare_profile_with_options(
                 env_config.allow_vars.clone()
             })
         }),
+        command_policies: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.command_policies.clone()),
         loaded_profile,
+    })
+}
+
+fn validate_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
+    let Some(command_policies) = profile.command_policies.as_ref() else {
+        return Ok(());
+    };
+    if !command_policies.is_active() {
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(nono::NonoError::UnsupportedPlatform(
+            "ETI command_policies are Linux-only in v1; profile validation can inspect them, but run/shell/wrap require Linux enforcement".to_string(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        validate_linux_command_policy_runtime_support(profile)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_command_policy_runtime_support(profile: &profile::Profile) -> crate::Result<()> {
+    if let Some(command_policies) = profile.command_policies.as_ref() {
+        let _resolved = crate::command_policy::resolve_policy_command_binaries(
+            command_policies,
+            std::env::var_os("PATH"),
+        )?;
+    }
+
+    if !command_policies_use_tcp_port_rules(profile) {
+        return Ok(());
+    }
+
+    let abi = nono::detect_abi().map_err(|err| {
+        nono::NonoError::UnsupportedPlatform(format!(
+            "ETI profile uses TCP port network rules but Landlock enforcement is unavailable: {err}"
+        ))
+    })?;
+    if !abi.has_network() {
+        return Err(nono::NonoError::UnsupportedPlatform(format!(
+            "ETI profile uses TCP port network rules but {} lacks Landlock TCP support (requires ABI V4+)",
+            abi
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn command_policies_use_tcp_port_rules(profile: &profile::Profile) -> bool {
+    let Some(command_policies) = profile.command_policies.as_ref() else {
+        return false;
+    };
+
+    for command in command_policies.commands.values() {
+        if command
+            .sandbox
+            .as_ref()
+            .is_some_and(command_sandbox_uses_tcp_port_rules)
+        {
+            return true;
+        }
+
+        for from_policy in command.from.values() {
+            if let crate::command_policy::CommandFromConfig::Policy(sandbox) = from_policy {
+                if command_sandbox_uses_tcp_port_rules(sandbox) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn command_sandbox_uses_tcp_port_rules(
+    sandbox: &crate::command_policy::CommandSandboxConfig,
+) -> bool {
+    sandbox.network.as_ref().is_some_and(|network| {
+        !network.tcp_connect_ports.is_empty() || !network.tcp_bind_ports.is_empty()
     })
 }
 
@@ -423,8 +512,47 @@ pub(crate) fn prepare_profile_for_preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "linux"))]
+    use crate::command_policy::{CommandPoliciesConfig, CommandPolicyConfig, CommandSandboxConfig};
+    #[cfg(not(target_os = "linux"))]
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
+
+    #[cfg(not(target_os = "linux"))]
+    fn active_command_policy_profile() -> profile::Profile {
+        profile::Profile {
+            command_policies: Some(CommandPoliciesConfig {
+                session_can_use: vec!["git".to_string()],
+                commands: BTreeMap::from([(
+                    "git".to_string(),
+                    CommandPolicyConfig {
+                        sandbox: Some(CommandSandboxConfig::default()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inactive_command_policy_runtime_support_is_ok() {
+        assert!(validate_command_policy_runtime_support(&profile::Profile::default()).is_ok());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn active_command_policy_runtime_support_rejects_non_linux() {
+        let err = validate_command_policy_runtime_support(&active_command_policy_profile())
+            .expect_err("active ETI runtime must fail on non-Linux");
+
+        assert!(
+            err.to_string().contains("Linux-only"),
+            "error should describe Linux-only ETI runtime: {err}"
+        );
+    }
 
     #[test]
     fn prepare_profile_for_preflight_matches_runtime_resolution() {

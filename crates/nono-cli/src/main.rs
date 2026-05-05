@@ -5,6 +5,7 @@
 mod app_runtime;
 mod audit_attestation;
 mod audit_commands;
+mod audit_event_reader;
 mod audit_integrity;
 mod audit_ledger;
 mod audit_session;
@@ -13,10 +14,12 @@ mod cli;
 mod cli_bootstrap;
 mod command_blocking_deprecation;
 mod command_display;
+mod command_policy;
 mod command_runtime;
 mod config;
 mod credential_runtime;
 mod deprecated_policy;
+mod eti_runtime;
 mod exec_strategy;
 mod execution_runtime;
 mod instruction_deny;
@@ -89,6 +92,10 @@ pub(crate) use launch_runtime::rollback_base_exclusions;
 pub(crate) use proxy_runtime::merge_dedup_ports;
 
 fn main() {
+    if eti_runtime::maybe_run_internal_eti_entrypoint() {
+        return;
+    }
+
     let legacy_network_warnings = collect_legacy_network_warnings();
     normalize_legacy_flag_env_vars();
     let cli = Cli::parse();
@@ -222,6 +229,7 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            command_policies: None,
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),
@@ -265,6 +273,7 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            command_policies: None,
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),
