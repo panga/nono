@@ -113,6 +113,7 @@ mod linux {
         config: CommandPoliciesConfig,
         resolved: ResolvedCommandBinaries,
         deny_only: BTreeMap<String, ResolvedDenyOnlyCommand>,
+        original_exec_dirs: Vec<PathBuf>,
         allowed_direct_bypasses: Vec<PathBuf>,
         allowed_direct_bypass_ids: HashSet<FileId>,
     }
@@ -236,6 +237,7 @@ mod linux {
                 config: config.clone(),
                 resolved,
                 deny_only,
+                original_exec_dirs,
                 allowed_direct_bypasses,
                 allowed_direct_bypass_ids,
             })
@@ -285,6 +287,7 @@ mod linux {
 
             let allowed_outer_exec_files = build_outer_exec_files(
                 &excluded_ids,
+                &plan.original_exec_dirs,
                 resolved_program,
                 shims_by_command.values(),
                 &plan.allowed_direct_bypasses,
@@ -2461,12 +2464,16 @@ mod linux {
 
     fn build_outer_exec_files<'a>(
         excluded_ids: &HashSet<FileId>,
+        original_exec_dirs: &[PathBuf],
         resolved_program: &Path,
         shims: impl Iterator<Item = &'a ShimIdentity>,
         allowed_direct_bypasses: &[PathBuf],
     ) -> Result<Vec<PathBuf>> {
         let mut seen = HashSet::new();
         let mut files = Vec::new();
+        for dir in original_exec_dirs {
+            add_executable_files_in_dir(&mut files, &mut seen, excluded_ids, dir)?;
+        }
         add_exact_exec_file_unless_excluded(&mut files, &mut seen, excluded_ids, resolved_program)?;
         for shim in shims {
             add_exact_exec_path(&mut files, &shim.path)?;
@@ -2476,6 +2483,32 @@ mod linux {
         }
         files.sort();
         Ok(files)
+    }
+
+    fn add_executable_files_in_dir(
+        files: &mut Vec<PathBuf>,
+        seen: &mut HashSet<FileId>,
+        excluded_ids: &HashSet<FileId>,
+        dir: &Path,
+    ) -> Result<()> {
+        for entry in fs::read_dir(dir).map_err(|source| NonoError::ConfigRead {
+            path: dir.to_path_buf(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| NonoError::ConfigRead {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+            add_exact_exec_file_unless_excluded(files, seen, excluded_ids, &path)?;
+        }
+        Ok(())
     }
 
     fn add_exact_exec_file_unless_excluded(

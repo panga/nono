@@ -1,0 +1,139 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "shell-git-ssh-demo",
+    "version": "1.0.0",
+    "description": "Demo tool sandboxing: sh may invoke git, git may invoke ssh with ssh-agent; direct git/ssh are denied.",
+    "author": "nono-project"
+  },
+  "security": {
+    "signal_mode": "isolated"
+  },
+  "filesystem": {},
+  "network": {
+    "block": false
+  },
+  "workdir": {
+    "access": "none"
+  },
+  "interactive": false,
+  "command_policies": {
+    "session_can_use": [
+      "sh"
+    ],
+    "credentials": {
+      "ssh-agent": {
+        "type": "ssh-agent",
+        "socket": "$SSH_AUTH_SOCK"
+      }
+    },
+    "commands": {
+      "sh": {
+        "executable": "/usr/bin/sh",
+        "can_use": [
+          "git"
+        ],
+        "sandbox": {
+          "fs_read": [
+            "."
+          ],
+          "fs_write": [
+            "."
+          ],
+          "environment": {
+            "allow_vars": [
+              "PATH",
+              "HOME",
+              "USER",
+              "LOGNAME",
+              "TERM",
+              "LANG",
+              "LC_*",
+              "GIT_*"
+            ]
+          }
+        }
+      },
+      "git": {
+        "executable": "/usr/bin/git",
+        "can_use": [
+          "ssh"
+        ],
+        "from": {
+          "sh": {
+            "fs_read": [
+              "."
+            ],
+            "fs_write": [
+              "."
+            ],
+            "environment": {
+              "allow_vars": [
+                "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "TERM",
+                "LANG",
+                "LC_*",
+                "GIT_*"
+              ],
+              "set_vars": {
+                "GIT_CONFIG_COUNT": "3",
+                "GIT_CONFIG_KEY_0": "core.sshCommand",
+                "GIT_CONFIG_VALUE_0": "ssh",
+                "GIT_CONFIG_KEY_1": "core.pager",
+                "GIT_CONFIG_VALUE_1": "",
+                "GIT_CONFIG_KEY_2": "advice.detachedHead",
+                "GIT_CONFIG_VALUE_2": "false",
+                "GIT_PAGER": "",
+                "GIT_SSH": "ssh",
+                "GIT_SSH_VARIANT": "ssh",
+                "GIT_TERMINAL_PROMPT": "0"
+              }
+            }
+          },
+          "session": "deny"
+        }
+      },
+      "ssh": {
+        "executable": "/usr/bin/ssh",
+        "from": {
+          "git": {
+            "use_credentials": [
+              "ssh-agent"
+            ],
+            "argv_prepend": [
+              "-o",
+              "IdentityFile=none"
+            ],
+            "fs_read_file": [
+              "$HOME/.ssh/known_hosts",
+              "$HOME/.ssh/known_hosts2",
+              "/etc/ssh/ssh_known_hosts",
+              "/etc/ssh/ssh_known_hosts2"
+            ],
+            "network": {
+              "tcp_connect_ports": [
+                22
+              ]
+            },
+            "environment": {
+              "allow_vars": [
+                "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "TERM",
+                "LANG",
+                "LC_*",
+                "GIT_PROTOCOL"
+              ]
+            }
+          },
+          "session": "deny"
+        }
+      }
+    }
+  }
+}

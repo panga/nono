@@ -1,0 +1,49 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "eti-curl-network-no-files",
+    "version": "1.0.0",
+    "description": "Allow curl network access without granting user file reads",
+    "author": "local"
+  },
+  "workdir": {
+    "access": "none"
+  },
+  "command_policies": {
+    "session_can_use": [
+      "curl"
+    ],
+    "commands": {
+      "curl": {
+        "executable": "/usr/bin/curl",
+        "sandbox": {
+          "argv_prepend": [
+            "--disable"
+          ],
+          "fs_read_file": [
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/certs/ca-certificates.crt"
+          ],
+          "network": {
+            "tcp_connect_ports": [
+              80,
+              443
+            ]
+          },
+          "environment": {
+            "allow_vars": [
+              "PATH",
+              "TERM",
+              "LANG",
+              "LC_*",
+              "NO_PROXY",
+              "HTTP_PROXY",
+              "HTTPS_PROXY",
+              "ALL_PROXY"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
