@@ -12,6 +12,8 @@ impl PreparedEtiRuntime {
     pub(crate) fn emitted_error_response(&self) -> bool {
         false
     }
+
+    pub(crate) fn cleanup_runtime_dir(&self) {}
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -404,6 +406,20 @@ mod linux {
             runtime_cleanup.disarm();
             eti_profile_log!("prepare:total: {:?}", start_total.elapsed());
             Ok(runtime)
+        }
+
+        /// Best-effort removal of the runtime dir. Safe to call multiple times and from
+        /// any exit path: on the success path it must be invoked explicitly before
+        /// `process::exit` (which bypasses Drop chains); on Rust unwind paths
+        /// `EtiState::Drop` provides a fallback that finds a stale dir already gone.
+        pub(crate) fn cleanup_runtime_dir(&self) {
+            if let Err(err) = guarded_remove_runtime_dir(&self.inner.runtime_dir) {
+                debug!(
+                    "ETI runtime dir cleanup skipped for {}: {}",
+                    self.inner.runtime_dir.display(),
+                    err
+                );
+            }
         }
 
         pub(crate) fn env_overrides(&self) -> Vec<(String, String)> {

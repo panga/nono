@@ -394,7 +394,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             unreachable!("execute_direct only returns on error");
         }
         exec_strategy::ExecStrategy::Supervised => {
-            let exit_code = execute_supervised_runtime(SupervisedRuntimeContext {
+            let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
                 caps: &caps,
                 command: &command,
@@ -406,8 +406,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),
                 silent: flags.silent,
-            })?;
+            });
 
+            // Runtime dir cleanup must run on both Ok and Err paths because
+            // `process::exit` (below for Ok, in main.rs for Err) bypasses Drop
+            // chains, leaking the per-invocation /run/user/$UID/nono-eti-* or
+            // /tmp/nono-eti-* dir otherwise.
+            if let Some(rt) = eti_runtime.as_ref() {
+                rt.cleanup_runtime_dir();
+            }
+
+            let exit_code = exit_result?;
             cleanup_capability_state_file(&cap_file_path);
             drop(config);
             drop(loaded_secrets);
