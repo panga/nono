@@ -411,6 +411,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             cleanup_capability_state_file(&cap_file_path);
             drop(config);
             drop(loaded_secrets);
+            crate::eti_runtime::log_main_total();
             std::process::exit(exit_code);
         }
     }
