@@ -667,6 +667,141 @@ where
     Ok(())
 }
 
+/// Maximum number of redirects to follow before giving up.
+const MAX_REDIRECTS: u8 = 5;
+
+/// Forward a request through the upstream pool and stream the response back
+/// to the inbound client as HTTP/1.1.
+///
+/// Handles both the pool send and writing the full HTTP/1.1 response (status
+/// line, headers, body) back to the raw TCP stream. Returns the response
+/// status code on success.
+///
+/// If the upstream returns a 3xx redirect, follows it transparently (up to
+/// [`MAX_REDIRECTS`] hops) without forwarding credentials. This prevents
+/// clients that don't strip auth headers on cross-domain redirects (e.g.
+/// Maven) from leaking credentials to presigned URLs.
+async fn pool_forward(
+    pool: &crate::pool::UpstreamPool,
+    tls_config: &std::sync::Arc<rustls::ClientConfig>,
+    req: http::Request<http_body_util::Full<bytes::Bytes>>,
+    inbound: &mut TcpStream,
+) -> Result<u16> {
+    use http_body_util::BodyExt;
+
+    let mut response = pool.send(tls_config, req).await?;
+    let mut redirects: u8 = 0;
+
+    // Follow 3xx redirects transparently
+    while response.status().is_redirection() && redirects < MAX_REDIRECTS {
+        let location = match response.headers().get(http::header::LOCATION) {
+            Some(loc) => match loc.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => break,
+            },
+            None => break,
+        };
+
+        debug!("pool: following redirect ({}) to {}", response.status(), location);
+
+        // Drain the redirect response body to release the connection
+        drop(response);
+
+        // Parse redirect URL and resolve host
+        let redirect_uri: http::Uri = match location.parse() {
+            Ok(uri) => uri,
+            Err(_) => {
+                return Err(ProxyError::HttpParse(format!(
+                    "invalid redirect Location: {}", location
+                )));
+            }
+        };
+
+        let host = match redirect_uri.host() {
+            Some(h) => h.to_string(),
+            None => {
+                return Err(ProxyError::HttpParse(format!(
+                    "redirect Location missing host: {}", location
+                )));
+            }
+        };
+        let port = redirect_uri.port_u16().unwrap_or(match redirect_uri.scheme_str() {
+            Some("http") => 80,
+            _ => 443,
+        });
+
+        // Resolve DNS for the redirect target
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
+            .await
+            .map_err(|e| ProxyError::UpstreamConnect {
+                host: host.clone(),
+                reason: format!("redirect DNS resolution failed: {}", e),
+            })?
+            .collect();
+        if addrs.is_empty() {
+            return Err(ProxyError::UpstreamConnect {
+                host: host.clone(),
+                reason: "redirect DNS returned no addresses".to_string(),
+            });
+        }
+
+        pool.pin_host(&host, &addrs);
+
+        // Build a simple GET to the redirect URL (no auth headers)
+        let redirect_req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(&location)
+            .header("Host", &host)
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .map_err(|e| ProxyError::HttpParse(format!("redirect request build: {}", e)))?;
+
+        response = pool.send(tls_config, redirect_req).await?;
+        redirects += 1;
+    }
+
+    let status = response.status().as_u16();
+    let version = response.version();
+
+    debug!("pool: upstream responded {} via {:?}", status, version);
+
+    // Write HTTP/1.1 status line
+    let reason = response.status().canonical_reason().unwrap_or("OK");
+    let status_line = format!("HTTP/1.1 {} {}\r\n", status, reason);
+    inbound.write_all(status_line.as_bytes()).await?;
+
+    // Write response headers
+    for (name, value) in response.headers() {
+        // Skip h2-specific pseudo-headers and connection-level headers
+        let name_str = name.as_str();
+        if name_str == "transfer-encoding" || name_str == "connection" {
+            continue;
+        }
+        inbound
+            .write_all(format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).as_bytes())
+            .await?;
+    }
+    inbound.write_all(b"\r\n").await?;
+
+    // Stream body frames without buffering
+    let mut body = response.into_body();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    inbound.write_all(data).await?;
+                }
+            }
+            Some(Err(e)) => {
+                debug!("pool: response body read error: {}", e);
+                break;
+            }
+            None => break,
+        }
+    }
+    inbound.flush().await?;
+
+    Ok(status)
+}
 /// Parse an HTTP request line into (method, path, version).
 fn parse_request_line(line: &str) -> Result<(String, String, String)> {
     let parts: Vec<&str> = line.split_whitespace().collect();
