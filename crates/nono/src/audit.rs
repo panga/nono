@@ -424,10 +424,7 @@ impl AuditRecorder {
 
     /// Record sandbox runtime metadata.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn record_sandbox_runtime_event(
-        &mut self,
-        event: SandboxRuntimeAuditEvent,
-    ) -> Result<()> {
+    pub fn record_sandbox_runtime_event(&mut self, event: SandboxRuntimeAuditEvent) -> Result<()> {
         self.append_event(AuditEventPayload::SandboxRuntime { event })
     }
 
