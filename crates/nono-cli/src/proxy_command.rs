@@ -74,6 +74,15 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     // validate it eagerly so a bad key/cert fails the command with a clear
     // error, rather than silently downgrading to no interception at server
     // start.
+    //
+    // ORDERING (load-bearing): this runs *after* `apply_tls_intercept_config`,
+    // which is what may install a keychain-managed CA from the profile's
+    // `ca_lifecycle=trusted`. Assigning `preloaded_ca` here last is what makes
+    // an operator-supplied CA authoritative over any profile-derived one — CLI
+    // options always win. Do not hoist this above `apply_tls_intercept_config`.
+    // `build_launch_options` additionally suppresses the profile's trust
+    // request when `--proxy-ca-cert` is present, so no keychain CA is minted
+    // (or authenticated for) only to be replaced here.
     if let (Some(cert_path), Some(key_path)) = (&args.proxy_ca_cert, &args.proxy_ca_key) {
         #[cfg(target_os = "macos")]
         if args.trust_proxy_ca {
@@ -317,25 +326,49 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         bypass: upstream_bypass,
     });
 
-    let ca_validity = args
-        .proxy_ca_validity
-        .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60));
+    // TLS interception: merge the profile's `network.tls_intercept` block with
+    // the CLI flags through the same resolver the sandboxed `run` path uses, so
+    // `ca_lifecycle`, `ca_validity`, `leaf_validity`, and `ca_env_vars` are all
+    // honoured here too. Building this from flags alone was issue #1667: a
+    // profile with `ca_lifecycle: "trusted"` was silently ignored and the proxy
+    // signed with a throwaway `CN=nono-session-ca` that nothing trusts.
+    let tls_options = crate::proxy_runtime::resolve_profile_tls_intercept_options(
+        network.and_then(|n| n.tls_intercept.as_ref()),
+        #[cfg(target_os = "macos")]
+        args.trust_proxy_ca,
+        args.proxy_ca_validity,
+    )?;
+
+    // CLI-supplied options always win. An explicit `--proxy-ca-cert` names the
+    // exact signing identity to use, so it overrides a profile's
+    // `ca_lifecycle=trusted` rather than erroring: drop the profile-derived
+    // trust request here so `apply_tls_intercept_config` doesn't install (or
+    // prompt for) a keychain CA that `run_proxy` would immediately replace with
+    // the supplied one. An explicit `--trust-proxy-ca` alongside
+    // `--proxy-ca-cert` is still a flag-vs-flag contradiction and is rejected
+    // in `run_proxy`.
+    #[cfg(target_os = "macos")]
+    let trust_proxy_ca = tls_options.trust_proxy_ca && args.proxy_ca_cert.is_none();
 
     #[cfg(target_os = "macos")]
-    let tls_intercept = if args.trust_proxy_ca || ca_validity.is_some() {
+    let tls_intercept = if trust_proxy_ca
+        || tls_options.ca_validity.is_some()
+        || !tls_options.ca_env_vars.is_empty()
+    {
         Some(TlsInterceptIntent {
-            trust_proxy_ca: args.trust_proxy_ca,
-            ca_validity,
-            ca_env_vars: Vec::new(),
+            trust_proxy_ca,
+            ca_validity: tls_options.ca_validity,
+            ca_env_vars: tls_options.ca_env_vars.clone(),
         })
     } else {
         None
     };
     #[cfg(not(target_os = "macos"))]
-    let tls_intercept = if ca_validity.is_some() {
+    let tls_intercept = if tls_options.ca_validity.is_some() || !tls_options.ca_env_vars.is_empty()
+    {
         Some(TlsInterceptIntent {
-            ca_validity,
-            ca_env_vars: Vec::new(),
+            ca_validity: tls_options.ca_validity,
+            ca_env_vars: tls_options.ca_env_vars.clone(),
         })
     } else {
         None
@@ -351,6 +384,10 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         credentials: credentials_intent,
         upstream_proxy,
         tls_intercept,
+        // Leaf validity rides alongside `tls_intercept` rather than inside it
+        // (matching `prepare_proxy_launch_options`), so carry it through
+        // explicitly or the profile's `leaf_validity` would be dropped here.
+        proxy_leaf_validity: tls_options.leaf_validity,
         command_policies,
         credential_capture,
         session_id: crate::session::generate_session_id(),
@@ -676,6 +713,208 @@ mod tests {
         let err =
             load_preloaded_ca(&cert_path, &key_path).expect_err("missing key file must error");
         assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    /// Write a profile with the given `network.tls_intercept` JSON body and
+    /// return its path (plus the tempdir, which must outlive it).
+    fn profile_with_tls_intercept(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("tls.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{
+                    "meta": {{ "name": "tls-test" }},
+                    "network": {{
+                        "allow_domain": ["example.com"],
+                        "tls_intercept": {body}
+                    }}
+                }}"#
+            ),
+        )
+        .expect("write profile");
+        (dir, path)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn profile_ca_lifecycle_trusted_is_honoured() {
+        // Regression (issue #1667): `nono proxy --profile <p>` ignored the
+        // profile's `tls_intercept.ca_lifecycle`, so a profile asking for the
+        // keychain-trusted CA still got a throwaway `CN=nono-session-ca`.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_dir, profile_path) =
+            profile_with_tls_intercept(r#"{ "ca_lifecycle": "trusted", "ca_validity": "365d" }"#);
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("trusted profile is valid");
+        let tls = opts
+            .tls_intercept
+            .expect("profile ca_lifecycle=trusted must produce a TLS intercept intent");
+        assert!(
+            tls.trust_proxy_ca,
+            "ca_lifecycle=trusted must set trust_proxy_ca without needing --trust-proxy-ca"
+        );
+        assert_eq!(
+            tls.ca_validity,
+            Some(std::time::Duration::from_secs(365 * 24 * 60 * 60)),
+            "profile ca_validity must be carried through"
+        );
+    }
+
+    #[test]
+    fn profile_ca_lifecycle_session_stays_untrusted() {
+        // The opposite direction: an explicit `session` lifecycle (and the
+        // default) must not opt into the keychain CA.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_dir, profile_path) = profile_with_tls_intercept(r#"{ "ca_lifecycle": "session" }"#);
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("session profile is valid");
+        #[cfg(target_os = "macos")]
+        assert!(
+            opts.tls_intercept.is_none_or(|tls| !tls.trust_proxy_ca),
+            "ca_lifecycle=session must not request the trusted CA"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(opts.tls_intercept.is_none());
+    }
+
+    #[test]
+    fn profile_leaf_validity_is_carried_through() {
+        // `leaf_validity` rides outside `TlsInterceptIntent`, so it needs its
+        // own wiring; without it the profile value was dropped.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_dir, profile_path) = profile_with_tls_intercept(r#"{ "leaf_validity": "15m" }"#);
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("leaf_validity profile is valid");
+        assert_eq!(
+            opts.proxy_leaf_validity,
+            Some(std::time::Duration::from_secs(15 * 60)),
+            "profile leaf_validity must reach the proxy config"
+        );
+    }
+
+    #[test]
+    fn profile_ca_env_vars_are_carried_through() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_dir, profile_path) =
+            profile_with_tls_intercept(r#"{ "ca_env_vars": ["REQUESTS_CA_BUNDLE"] }"#);
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("ca_env_vars profile is valid");
+        let tls = opts
+            .tls_intercept
+            .expect("ca_env_vars alone must produce a TLS intercept intent");
+        assert_eq!(tls.ca_env_vars, vec!["REQUESTS_CA_BUNDLE".to_string()]);
+    }
+
+    #[test]
+    fn flag_ca_validity_overrides_profile() {
+        // Precedence: an explicit flag beats the profile, matching the rest of
+        // the CLI and the sandboxed `run` path.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_dir, profile_path) = profile_with_tls_intercept(r#"{ "ca_validity": "365d" }"#);
+        let args = parse_args(&[
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--proxy-ca-validity",
+            "7",
+        ]);
+        let opts = build_launch_options(&args).expect("flag override is valid");
+        let tls = opts.tls_intercept.expect("intent present");
+        assert_eq!(
+            tls.ca_validity,
+            Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
+            "--proxy-ca-validity must win over the profile value"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trust_flag_conflicting_with_session_profile_is_rejected() {
+        // `--trust-proxy-ca` against an explicit `ca_lifecycle=session` is a
+        // contradiction; the shared resolver must reject it here exactly as it
+        // does on the sandboxed path rather than silently picking a side.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_dir, profile_path) = profile_with_tls_intercept(r#"{ "ca_lifecycle": "session" }"#);
+        let args = parse_args(&[
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--trust-proxy-ca",
+        ]);
+        let err = build_launch_options(&args).expect_err("conflicting trust request must fail");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn profile_ca_lifecycle_trusted_is_rejected_off_macos() {
+        // The keychain CA is macOS-only; asking for it elsewhere must fail
+        // loudly instead of silently downgrading to a session CA.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_dir, profile_path) = profile_with_tls_intercept(r#"{ "ca_lifecycle": "trusted" }"#);
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let err = build_launch_options(&args).expect_err("trusted off macOS must fail");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn custom_ca_flag_overrides_profile_trusted_ca() {
+        // CLI-supplied options always win: `--proxy-ca-cert` names the exact
+        // signing identity, so it overrides the profile's
+        // `ca_lifecycle=trusted` instead of erroring. The profile's trust
+        // request must be suppressed so no keychain CA is minted (or
+        // authenticated for) only for `run_proxy` to replace it.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_ca_dir, cert_path, key_path) = write_ca_pair();
+        let (_dir, profile_path) = profile_with_tls_intercept(r#"{ "ca_lifecycle": "trusted" }"#);
+        let args = parse_args(&[
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--proxy-ca-cert",
+            cert_path.to_str().expect("valid utf8"),
+            "--proxy-ca-key",
+            key_path.to_str().expect("valid utf8"),
+        ]);
+        let opts = build_launch_options(&args).expect("custom CA overrides the profile");
+        assert!(
+            opts.tls_intercept.is_none_or(|tls| !tls.trust_proxy_ca),
+            "--proxy-ca-cert must suppress the profile's keychain-CA request"
+        );
+    }
+
+    #[test]
+    fn custom_ca_is_used_verbatim() {
+        // A caller-supplied CA must survive profile resolution: the material
+        // `run_proxy` installs is exactly the supplied certificate.
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let (_ca_dir, cert_path, key_path) = write_ca_pair();
+        let (_dir, profile_path) = profile_with_tls_intercept(r#"{ "leaf_validity": "15m" }"#);
+        let args = parse_args(&[
+            "--profile",
+            profile_path.to_str().expect("valid utf8"),
+            "--proxy-ca-cert",
+            cert_path.to_str().expect("valid utf8"),
+            "--proxy-ca-key",
+            key_path.to_str().expect("valid utf8"),
+        ]);
+        build_launch_options(&args).expect("custom CA with a profile is valid");
+
+        let expected = std::fs::read_to_string(&cert_path).expect("read cert");
+        let preloaded = load_preloaded_ca(&cert_path, &key_path).expect("supplied CA must load");
+        assert_eq!(
+            preloaded.cert_pem.trim(),
+            expected.trim(),
+            "the supplied CA certificate must be used verbatim"
+        );
     }
 
     #[test]

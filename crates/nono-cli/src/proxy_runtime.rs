@@ -1615,25 +1615,42 @@ pub(crate) fn prepare_proxy_launch_options(
     Ok(NetworkIntent::ProxyFiltered(Box::new(opts)))
 }
 
-struct ResolvedTlsInterceptOptions {
+pub(crate) struct ResolvedTlsInterceptOptions {
     #[cfg(target_os = "macos")]
-    trust_proxy_ca: bool,
-    ca_validity: Option<std::time::Duration>,
-    leaf_validity: Option<std::time::Duration>,
-    ca_env_vars: Vec<String>,
+    pub(crate) trust_proxy_ca: bool,
+    pub(crate) ca_validity: Option<std::time::Duration>,
+    pub(crate) leaf_validity: Option<std::time::Duration>,
+    pub(crate) ca_env_vars: Vec<String>,
 }
 
-fn resolve_tls_intercept_options(
-    args: &SandboxArgs,
-    prepared: &PreparedSandbox,
+/// Merge a profile's `network.tls_intercept` block with the equivalent CLI
+/// flags into the effective TLS-interception settings.
+///
+/// Shared by the sandboxed `run`/`shell`/`wrap` path and the standalone
+/// `nono proxy` command so both honour the profile identically. `nono proxy`
+/// previously built its `TlsInterceptIntent` from flags alone and silently
+/// ignored `ca_lifecycle` / `ca_validity` / `leaf_validity` / `ca_env_vars`,
+/// signing with a per-session `CN=nono-session-ca` that nothing trusts even
+/// when the profile asked for the keychain-trusted CA (issue #1667).
+///
+/// Precedence matches the rest of the CLI: an explicit flag wins over the
+/// profile, and the boolean `trust_proxy_ca` is the union of the flag and the
+/// profile's `ca_lifecycle=trusted` (a flag cannot turn trust *off*, which is
+/// why the conflicting combination is rejected rather than silently resolved).
+///
+/// `trust_proxy_ca` is the caller's `--trust-proxy-ca` flag (macOS only, where
+/// the flag exists).
+pub(crate) fn resolve_profile_tls_intercept_options(
+    profile_tls: Option<&crate::profile::TlsInterceptConfig>,
+    #[cfg(target_os = "macos")] trust_proxy_ca: bool,
+    proxy_ca_validity_days: Option<u32>,
 ) -> Result<ResolvedTlsInterceptOptions> {
-    let profile_tls = prepared.tls_intercept.as_ref();
     #[cfg(target_os = "macos")]
     let profile_trusted = profile_tls
         .map(|tls| matches!(tls.ca_lifecycle, crate::profile::TlsCaLifecycle::Trusted))
         .unwrap_or(false);
     #[cfg(target_os = "macos")]
-    if args.trust_proxy_ca
+    if trust_proxy_ca
         && let Some(tls) = profile_tls
         && tls.ca_lifecycle == crate::profile::TlsCaLifecycle::Session
     {
@@ -1657,8 +1674,7 @@ fn resolve_tls_intercept_options(
         .and_then(|tls| tls.ca_validity.as_deref())
         .map(|value| crate::profile::parse_tls_duration("network.tls_intercept.ca_validity", value))
         .transpose()?;
-    let ca_validity = args
-        .proxy_ca_validity
+    let ca_validity = proxy_ca_validity_days
         .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60))
         .or(profile_ca_validity);
     let leaf_validity = profile_tls
@@ -1670,13 +1686,25 @@ fn resolve_tls_intercept_options(
 
     Ok(ResolvedTlsInterceptOptions {
         #[cfg(target_os = "macos")]
-        trust_proxy_ca: args.trust_proxy_ca || profile_trusted,
+        trust_proxy_ca: trust_proxy_ca || profile_trusted,
         ca_validity,
         leaf_validity,
         ca_env_vars: profile_tls
             .map(|tls| tls.ca_env_vars.clone())
             .unwrap_or_default(),
     })
+}
+
+fn resolve_tls_intercept_options(
+    args: &SandboxArgs,
+    prepared: &PreparedSandbox,
+) -> Result<ResolvedTlsInterceptOptions> {
+    resolve_profile_tls_intercept_options(
+        prepared.tls_intercept.as_ref(),
+        #[cfg(target_os = "macos")]
+        args.trust_proxy_ca,
+        args.proxy_ca_validity,
+    )
 }
 
 #[must_use = "effective proxy settings resolution result must be handled"]
